@@ -1,0 +1,17 @@
+# configs/faiss.yml
+# FAISS configuration for building/searching indexes
+# Default : Flat : (IndexFlatIP) on L2-normalized embeddings for cosine similarity
+
+index_type: "flat"   # "flat" or "ivf"
+index_path: "indexes/faiss_index.idx"
+metadata_path: "indexes/metadata.jsonl"
+
+# IVF Parameters
+nlist: 100
+nprobe: 10
+
+# Search parameters
+k: 10
+
+# Whether embeddings are already L2 normalized. If False, script will normalzie them before indexing
+embeddings_normalized: true

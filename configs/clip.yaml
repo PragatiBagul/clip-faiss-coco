@@ -1,0 +1,11 @@
+# configs/clip.yaml
+
+model_name: 'ViT-B/32'
+device: 'cpu'
+
+image_size: 224
+batch_size: 64
+
+normalize_embeddings: true
+#normalize_embeddings: true → ensures cosine similarity works with FAISS IndexFlatIP.
+dtype: "float32"
