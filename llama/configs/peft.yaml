@@ -1,5 +1,4 @@
-# llama/configs/peft.yaml
-# Lora default hyperparameters (used by finetune scripts).
+# LoRA hyperparameter recommendations
 lora_r: 8
 lora_alpha: 32
 lora_dropout: 0.1
@@ -9,3 +8,8 @@ target_modules:
   - v_proj
   - o_proj
   - dense
+training:
+  batch_size: 32
+  lr: 2e-4
+  warmup: 200
+  epochs: 3
