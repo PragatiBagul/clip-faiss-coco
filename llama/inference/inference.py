@@ -1,139 +1,153 @@
-# llama/inference/inference.py
 """
-LLaMA inference wrapper with optional LoRA (PEFT) adapter loading and deterministic seeding.
+llama/inference/inference.py
 
-Public API:
-- load_model(config_path="llama/configs/llama.yaml", adapter_path=None)
-- generate_from_prompt(prompt, max_new_tokens=128, temperature=0.7, top_p=0.9, num_return_sequences=1, seed=None)
+Lightweight inference wrapper for HF causal LMs (LLaMA-like) with optional LoRA/PEFT adapter support.
 
-Notes:
-- If seed is provided, we set torch, numpy, and python random seeds for reproducible generation (best-effort).
-- Generation uses transformers' generation API and returns the completion (attempts to strip prompt).
+Usage:
+    from llama.inference.inference import LlamaGenerator
+
+    gen = LlamaGenerator(
+        base_model="meta-llama/Llama-2-7b-chat-hf",
+        lora_adapter_path=None,
+        use_8bit=True,
+        device=None
+    )
+    out = gen.generate_from_prompt("Write a JSON caption for an image: ...", max_new_tokens=128)
 """
 
-import os
+from typing import Optional, Dict, Any, List
+import torch
 import json
 import logging
-from typing import Optional, Dict, Any
-
-import yaml
-import torch
-import numpy as np
 import random
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
-from peft import PeftModel
+
+try:
+    from peft import PeftModel
+    _has_peft = True
+except Exception:
+    _has_peft = False
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-_model = None
-_tokenizer = None
-_config = None
-_peft_applied = False
+logging.basicConfig(level=logging.INFO)
 
 
-def load_config(path: str = "llama/configs/llama.yaml") -> Dict[str, Any]:
-    return yaml.safe_load(open(path, "r", encoding="utf-8"))
+class LlamaGenerator:
+    def __init__(
+        self,
+        base_model: str,
+        lora_adapter_path: Optional[str] = None,
+        use_8bit: bool = False,
+        device: Optional[str] = None,
+        trust_remote_code: bool = True,
+    ):
+        self.base_model = base_model
+        self.lora_adapter_path = lora_adapter_path
+        self.use_8bit = use_8bit
+        self.trust_remote_code = trust_remote_code
 
+        # auto detect device
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
 
-def _set_seed(seed: Optional[int]):
-    if seed is None:
-        return
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        logger.info(f"Loading model {base_model} on {self.device} (8bit={use_8bit})")
 
+        # tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=False, trust_remote_code=self.trust_remote_code)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-def load_model(config_path: str = "llama/configs/llama.yaml", adapter_path: Optional[str] = None):
-    global _model, _tokenizer, _config, _peft_applied
+        model_kwargs = {"trust_remote_code": self.trust_remote_code}
+        if self.use_8bit:
+            model_kwargs["load_in_8bit"] = True
 
-    if _model is not None and _tokenizer is not None:
-        logger.info("Model already loaded.")
-        return _model, _tokenizer
-
-    _config = load_config(config_path)
-    model_name = _config.get("model_name")
-    device_pref = _config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-    use_8bit = bool(_config.get("use_8bit", False))
-
-    logger.info(f"Loading tokenizer for {model_name}")
-    _tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    if _tokenizer.pad_token_id is None:
-        _tokenizer.pad_token_id = _tokenizer.eos_token_id
-
-    logger.info(f"Loading model {model_name} use_8bit={use_8bit}")
-    if use_8bit:
-        # 8-bit load
-        _model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            load_in_8bit=True,
-            device_map="auto",
-            trust_remote_code=True
-        )
-    else:
-        # FP16/FP32 load depending on device
-        _model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto" if device_pref != "cpu" else None,
-            torch_dtype=torch.float16 if device_pref != "cpu" else torch.float32,
-            trust_remote_code=True
-        )
-
-    if adapter_path:
-        logger.info(f"Attempting to attach PEFT adapter from {adapter_path}")
         try:
-            _model = PeftModel.from_pretrained(_model, adapter_path)
-            _peft_applied = True
+            if self.device == "cuda":
+                self.model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto", **model_kwargs)
+            else:
+                # cpu
+                self.model = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cpu"}, **model_kwargs)
         except Exception as e:
-            logger.warning(f"Failed to attach adapter: {e}")
-            _peft_applied = False
+            logger.warning(f"Model load with device_map failed: {e}. Falling back to simple load.")
+            self.model = AutoModelForCausalLM.from_pretrained(base_model, low_cpu_mem_usage=True, **({"trust_remote_code": self.trust_remote_code}))
 
-    logger.info("Model loaded.")
-    return _model, _tokenizer
+        # attach adapter if present
+        if lora_adapter_path:
+            if not _has_peft:
+                raise ImportError("PEFT not installed. Install peft to load LoRA adapters.")
+            logger.info(f"Loading PEFT adapter from {lora_adapter_path}")
+            self.model = PeftModel.from_pretrained(self.model, lora_adapter_path, device_map="auto" if self.device == "cuda" else {"": "cpu"})
 
+        self.model.eval()
 
-def generate_from_prompt(
-    prompt: str,
-    max_new_tokens: int = 128,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    num_return_sequences: int = 1,
-    seed: Optional[int] = None,
-    config_path: str = "llama/configs/llama.yaml"
-) -> str:
-    """
-    Synchronous generation. Returns the generated text (completion).
-    If seed is provided, generate deterministically (best-effort).
-    """
-    global _model, _tokenizer, _config
+    def _set_seed(self, seed: Optional[int]):
+        if seed is None:
+            return
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-    if _model is None or _tokenizer is None:
-        load_model(config_path=config_path, adapter_path=_config.get("adapter_path") if _config else None)
+    def generate_from_prompt(
+        self,
+        prompt: str,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        num_return_sequences: int = 1,
+        do_sample: bool = True,
+        seed: Optional[int] = None,
+        return_full_text: bool = False,
+        **generate_kwargs
+    ) -> List[str]:
+        self._set_seed(seed)
 
-    cfg = _config or load_config(config_path)
-    # apply seed if given
-    _set_seed(seed or cfg.get("seed"))
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True)
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    gen_cfg = GenerationConfig(
-        temperature=temperature or cfg.get("temperature", 0.7),
-        top_p=top_p or cfg.get("top_p", 0.9),
-        max_new_tokens=max_new_tokens or cfg.get("max_length", 256),
-        do_sample=True,
-        num_return_sequences=num_return_sequences
-    )
+        gen_config = GenerationConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            do_sample=do_sample,
+            max_new_tokens=max_new_tokens,
+            **generate_kwargs
+        )
 
-    inputs = _tokenizer(prompt, return_tensors="pt", truncation=True).to(_model.device)
-    with torch.no_grad():
-        outputs = _model.generate(**inputs, generation_config=gen_cfg)
-    texts = [_tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                generation_config=gen_config,
+                num_return_sequences=num_return_sequences,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
 
-    # strip prompt where possible
-    def strip_prompt(full_text: str, prompt_text: str) -> str:
-        if full_text.startswith(prompt_text):
-            return full_text[len(prompt_text):].strip()
-        return full_text.strip()
+        decoded = []
+        for i in range(num_return_sequences):
+            seq = outputs[i] if num_return_sequences > 1 else outputs
+            text = self.tokenizer.decode(seq, skip_special_tokens=True)
+            if not return_full_text and text.startswith(prompt):
+                text = text[len(prompt):].strip()
+            decoded.append(text)
+        return decoded
 
-    results = [strip_prompt(t, prompt) for t in texts]
-    return results[0] if len(results) == 1 else results
+    def generate_json(self, prompt: str, **kwargs) -> Dict[str, Any]:
+        outs = self.generate_from_prompt(prompt, **kwargs)
+        raw = outs[0].strip()
+        try:
+            parsed = json.loads(raw)
+            return {"success": True, "parsed": parsed, "raw": raw}
+        except Exception:
+            return {"success": False, "parsed": None, "raw": raw}
+
+    def close(self):
+        try:
+            del self.model
+            torch.cuda.empty_cache()
+        except Exception:
+            pass

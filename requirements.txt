@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+transformers>=4.30
+torch
+peft
+datasets
+accelerate
+bitsandbytes
+streamlit
+pydantic
+pytest
