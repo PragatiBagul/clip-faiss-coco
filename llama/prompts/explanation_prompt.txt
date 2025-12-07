@@ -1,0 +1,14 @@
+You are an assistant that explains why images match a user query.
+
+User Query:
+{user_query}
+
+Top-k retrieved captions (with scores):
+{retrieved_captions_with_scores}
+
+Task:
+1) Provide a short explanation (2-4 sentences) summarizing why these images match the query.
+2) List 3 common attributes or themes these images share (comma-separated).
+3) Provide one caveat or possible mismatch risk.
+
+Output as plain text with three sections: Explanation, CommonAttributes, Caveat.

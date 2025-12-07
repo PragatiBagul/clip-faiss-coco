@@ -1,0 +1,8 @@
+Given several captions of images that match the query "{user_query}", summarize what these images have in common (1 paragraph), and provide 5 short keywords (comma-separated).
+
+Captions:
+{retrieved_captions}
+
+Output:
+Summary: ...
+Keywords: ...
